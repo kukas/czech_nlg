@@ -1,0 +1,8 @@
+torch
+transformers[sentencepiece]
+datasets
+sacrebleu
+rouge_score
+wandb
+torchinfo
+
