@@ -77,6 +77,10 @@ class DataTrainingArguments:
             "help": "The configuration name of the dataset to use (via the datasets library)."
         },
     )
+    dataset_data_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to the dataset local files"},
+    )
     train_file: Optional[str] = field(
         default=None, metadata={"help": "The input training data file (a jsonlines)."}
     )
@@ -173,7 +177,6 @@ def parse_args():
 
     # Sanity checks
 
-    # TODO: add t5 warning (from run_translation.py)
     # TODO: add checkpoint reload warning (from run_translation.py)
 
     # Check if we have a dataset
@@ -226,6 +229,53 @@ class DatasetPreprocessing:
     def rename_columns_cs_restaurants(self, datasets):
         return datasets.rename_column("text", "target").rename_column("da", "input")
 
+    def rename_columns_translation_dataset(
+        self, datasets, source_lang="en", target_lang="cs"
+    ):
+        def _preprocess_function(examples):
+            inputs = [ex[source_lang] for ex in examples["translation"]]
+            targets = [ex[target_lang] for ex in examples["translation"]]
+            return {"input": inputs, "target": targets}
+
+        return datasets.map(
+            _preprocess_function,
+            batched=True,
+            num_proc=self.preprocessing_num_workers,
+        )
+
+    def rename_columns_web_nlg(self, datasets, target_lang="cs", lex_source="deepl"):
+        def _preprocess_function(examples):
+            inputs = []
+            targets = []
+
+            for modified_triple_sets, lexes in zip(
+                examples["modified_triple_sets"],
+                examples["lex"],
+            ):
+
+                assert len(modified_triple_sets["mtriple_set"]) == 1
+                modifiedtriple = " - ".join(modified_triple_sets["mtriple_set"][0])
+
+                filtered_lexes = [
+                    text
+                    for text, lang, source in zip(
+                        lexes["text"], lexes["lang"], lexes["source"]
+                    )
+                    if lang == target_lang and lex_source in source
+                ]
+                for lex in filtered_lexes:
+                    inputs.append(modifiedtriple)
+                    targets.append(lex)
+
+            return {"input": inputs, "target": targets}
+
+        return datasets.map(
+            _preprocess_function,
+            batched=True,
+            num_proc=self.preprocessing_num_workers,
+            remove_columns=datasets["train"].column_names,
+        )
+
     def select_dataset_subset(
         self, datasets, max_train_samples, max_eval_samples, max_predict_samples
     ):
@@ -235,7 +285,7 @@ class DatasetPreprocessing:
             "test": max_predict_samples,
         }
         for split_name, args_limit in limits.items():
-            if args_limit is not None:
+            if split_name in datasets and args_limit is not None:
                 limit = min(len(datasets[split_name]), args_limit)
                 datasets[split_name] = datasets[split_name].select(range(limit))
 
@@ -255,7 +305,6 @@ class DatasetPreprocessing:
         def _preprocess_function(examples):
             inputs = examples["input"]
             targets = examples["target"]
-            # inputs = [prefix + inp for inp in inputs]
             model_inputs = tokenizer(
                 inputs,
                 max_length=max_source_length,
@@ -406,6 +455,9 @@ class Evaluation:
         df.to_csv(csv_path)
         logger.info(f"Evaluation set outputs saved in {csv_path}")
 
+        # print the evaluation predictions
+        print(df)
+
         df = pd.DataFrame([result])
         csv_path = os.path.join(
             output_dir, f"results_{self.metric_key_prefix}-{step}.csv"
@@ -435,16 +487,47 @@ def handle_mbart(model, tokenizer, forced_bos_token):
         #     "--target_lang arguments."
         # )
 
-        tokenizer.src_lang = "en_XX"
-        tokenizer.tgt_lang = "cs_CZ"
+        # fixes for the M2M100 tokenizer
+        if isinstance(tokenizer, M2M100Tokenizer):
+            tokenizer.src_lang = "en"
+            tokenizer.tgt_lang = "cs"
+            target_lang = "cs"
+        else:
+            tokenizer.src_lang = "en_XX"
+            tokenizer.tgt_lang = "cs_CZ"
 
-        # For multilingual translation models like mBART-50 and M2M100 we need to force the target language token
-        # as the first generated token. We ask the user to explicitly provide this as --forced_bos_token argument.
-        forced_bos_token_id = None
-        if forced_bos_token is not None:
-            forced_bos_token_id = tokenizer.lang_code_to_id[forced_bos_token]
+            # For multilingual translation models like mBART-50 and M2M100 we need to force the target language token
+            # as the first generated token.
+            target_lang = "cs_CZ"
+
+        if hasattr(tokenizer, "lang_code_to_id"):
+            forced_bos_token_id = tokenizer.lang_code_to_id[target_lang]
+        else:
+            forced_bos_token_id = tokenizer.convert_tokens_to_ids(target_lang)
+
+        print(
+            "mBART/M2M lang code token: ",
+            target_lang,
+            tokenizer.lang_code_to_id[target_lang],
+            tokenizer.convert_tokens_to_ids(target_lang),
+        )
+        print(
+            "BOS tokens before: ",
+            model.config.forced_bos_token_id,
+            model.config.decoder_start_token_id,
+        )
 
         model.config.forced_bos_token_id = forced_bos_token_id
+
+        # Set decoder_start_token_id
+        if model.config.decoder_start_token_id is None:
+            model.config.decoder_start_token_id = forced_bos_token_id
+
+        print(
+            "BOS tokens after: ",
+            model.config.forced_bos_token_id,
+            model.config.decoder_start_token_id,
+        )
 
 
 def detect_last_checkpoint(output_dir, overwrite_output_dir, resume_from_checkpoint):
@@ -493,6 +576,7 @@ def main():
         raw_datasets = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
+            data_dir=data_args.dataset_data_dir,
             cache_dir=model_args.cache_dir,
         )
     else:
@@ -511,6 +595,16 @@ def main():
         use_fast=model_args.use_fast_tokenizer,
     )
 
+    # Prepare model
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        model_args.model_name_or_path, cache_dir=model_args.cache_dir
+    )
+
+    model.resize_token_embeddings(len(tokenizer))
+
+    # Custom code for mBART
+    handle_mbart(model, tokenizer, data_args.forced_bos_token)
+
     # Prepare data
     # - Preprocess data
     # - remove markup in das
@@ -520,14 +614,27 @@ def main():
 
     preprocessed_datasets = raw_datasets
 
-    preprocessed_datasets = dp.rename_columns_cs_restaurants(preprocessed_datasets)
-
     preprocessed_datasets = dp.select_dataset_subset(
         preprocessed_datasets,
         data_args.max_train_samples,
         data_args.max_eval_samples,
         data_args.max_predict_samples,
     )
+
+    if data_args.dataset_name == "cs_restaurants":
+        preprocessed_datasets = dp.rename_columns_cs_restaurants(preprocessed_datasets)
+    if data_args.dataset_name == "wmt19":
+        preprocessed_datasets = dp.rename_columns_translation_dataset(
+            preprocessed_datasets
+        )
+    if "web_nlg" in data_args.dataset_name:
+        preprocessed_datasets = dp.rename_columns_web_nlg(preprocessed_datasets)
+
+    # TODO: add for T5
+    # if data_args.source_prefix is not None:
+    #     preprocessed_datasets = dp.add_source_prefix(
+    #         preprocessed_datasets, data_args.source_prefix
+    #     )
 
     padding = "max_length" if data_args.pad_to_max_length else False
     preprocessed_datasets = dp.tokenize(
@@ -537,11 +644,6 @@ def main():
         data_args.max_source_length,
         data_args.max_target_length,
         data_args.ignore_pad_token_for_loss,
-    )
-
-    # Prepare model
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_args.model_name_or_path, cache_dir=model_args.cache_dir
     )
 
     # Prepare data collator
@@ -557,9 +659,6 @@ def main():
             label_pad_token_id=label_pad_token_id,
             pad_to_multiple_of=8 if training_args.fp16 else None,
         )
-
-    # Custom code for mBART
-    handle_mbart(model, tokenizer, data_args.forced_bos_token)
 
     # Evaluation class
     evaluation = Evaluation(tokenizer, data_args.ignore_pad_token_for_loss)
@@ -582,6 +681,10 @@ def main():
 
     # TODO: rewrite?
     evaluation.trainer = trainer
+
+    # if training_args.do_preeval:
+    #     logger.info("*** Pre-evaluation ***")
+    #     trainer.evaluate()
 
     # Training
     # - custom evaluation function
