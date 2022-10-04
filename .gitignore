@@ -2,3 +2,4 @@ __pycache__/
 wandb/
 experiments/
 datasets/
+00_old_scripts/
