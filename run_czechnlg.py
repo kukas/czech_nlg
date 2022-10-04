@@ -22,6 +22,7 @@ from transformers import (
     MBart50Tokenizer,
     MBart50TokenizerFast,
     M2M100Tokenizer,
+    NllbTokenizer,
 )
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -29,6 +30,7 @@ import datasets
 from datasets import load_dataset
 
 from evaluation import Evaluation
+from dataset_utils import DatasetPreprocessing
 
 # from evaluation import run_e2e_metrics, run_slot_error_rate_metric
 
@@ -217,140 +219,7 @@ def load_custom_dataset(train_file, validation_file, test_file, cache_dir=None):
     return raw_datasets
 
 
-class DatasetPreprocessing:
-    """Class that handles dataset preprocessing pipeline"""
-
-    def __init__(self, preprocessing_num_workers):
-        self.preprocessing_num_workers = preprocessing_num_workers
-
-    def rename_columns_cs_restaurants(self, datasets):
-        return datasets.rename_column("text", "target").rename_column("da", "input")
-
-    def rename_columns_translation_dataset(
-        self, datasets, source_lang="en", target_lang="cs"
-    ):
-        def _preprocess_function(examples):
-            inputs = [ex[source_lang] for ex in examples["translation"]]
-            targets = [ex[target_lang] for ex in examples["translation"]]
-            return {"input": inputs, "target": targets}
-
-        return datasets.map(
-            _preprocess_function,
-            batched=True,
-            num_proc=self.preprocessing_num_workers,
-        )
-
-    def rename_columns_web_nlg(self, datasets, target_lang="cs", lex_source="deepl"):
-        def _preprocess_function(examples):
-            inputs = []
-            targets = []
-
-            for modified_triple_sets, lexes in zip(
-                examples["modified_triple_sets"],
-                examples["lex"],
-            ):
-
-                assert len(modified_triple_sets["mtriple_set"]) == 1
-                modifiedtriple = " - ".join(modified_triple_sets["mtriple_set"][0])
-
-                filtered_lexes = [
-                    text
-                    for text, lang, source in zip(
-                        lexes["text"], lexes["lang"], lexes["source"]
-                    )
-                    if lang == target_lang and lex_source in source
-                ]
-                for lex in filtered_lexes:
-                    inputs.append(modifiedtriple)
-                    targets.append(lex)
-
-            return {"input": inputs, "target": targets}
-
-        return datasets.map(
-            _preprocess_function,
-            batched=True,
-            num_proc=self.preprocessing_num_workers,
-            remove_columns=datasets["train"].column_names,
-        )
-
-    def select_dataset_subset(
-        self, datasets, max_train_samples, max_eval_samples, max_predict_samples
-    ):
-        limits = {
-            "train": max_train_samples,
-            "validation": max_eval_samples,
-            "test": max_predict_samples,
-        }
-        for split_name, args_limit in limits.items():
-            if split_name in datasets and args_limit is not None:
-                limit = min(len(datasets[split_name]), args_limit)
-                datasets[split_name] = datasets[split_name].select(range(limit))
-
-        return datasets
-
-    def tokenize(
-        self,
-        datasets,
-        tokenizer,
-        padding,
-        max_source_length,
-        max_target_length,
-        ignore_pad_token_for_loss,
-    ):
-        # assert tokenizer is not None
-
-        def _preprocess_function(examples):
-            inputs = examples["input"]
-            targets = examples["target"]
-            model_inputs = tokenizer(
-                inputs,
-                max_length=max_source_length,
-                padding=padding,
-                truncation=True,
-            )
-
-            # Setup the tokenizer for targets
-            with tokenizer.as_target_tokenizer():
-                labels = tokenizer(
-                    targets,
-                    max_length=max_target_length,
-                    padding=padding,
-                    truncation=True,
-                )
-
-            # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
-            # padding in the loss.
-            if padding == "max_length" and ignore_pad_token_for_loss:
-                labels["input_ids"] = [
-                    [(l if l != tokenizer.pad_token_id else -100) for l in label]
-                    for label in labels["input_ids"]
-                ]
-
-            model_inputs["labels"] = labels["input_ids"]
-            return model_inputs
-
-        any_split = next(iter(datasets.keys()))
-        column_names = datasets[any_split].column_names
-
-        return datasets.map(
-            _preprocess_function,
-            batched=True,
-            num_proc=self.preprocessing_num_workers,
-            remove_columns=column_names,
-        )
-
-    def call_method(self, func_name, datasets, **kwargs):
-        assert hasattr(
-            self, func_name
-        ), f"Preprocessing method {func_name} not defined!"
-
-        func = getattr(self, func_name)
-        datasets = func(datasets, **kwargs)
-
-        return datasets
-
-
-def handle_mbart(model, tokenizer, forced_bos_token):
+def handle_multilingual(model, tokenizer, forced_bos_token):
     # For translation we set the codes of our source and target languages (only useful for mBART, the others will
     # ignore those attributes).
 
@@ -360,6 +229,7 @@ def handle_mbart(model, tokenizer, forced_bos_token):
         MBart50Tokenizer,
         MBart50TokenizerFast,
         M2M100Tokenizer,
+        NllbTokenizer,
     )
     if isinstance(tokenizer, MULTI):
         # assert (
@@ -374,6 +244,10 @@ def handle_mbart(model, tokenizer, forced_bos_token):
             tokenizer.src_lang = "en"
             tokenizer.tgt_lang = "cs"
             target_lang = "cs"
+        elif isinstance(tokenizer, NllbTokenizer):
+            tokenizer.src_lang = "eng_Latn"
+            tokenizer.tgt_lang = "ces_Latn"
+            target_lang = "ces_Latn"
         else:
             tokenizer.src_lang = "en_XX"
             tokenizer.tgt_lang = "cs_CZ"
@@ -479,13 +353,16 @@ def main():
 
     # Prepare model
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_args.model_name_or_path, cache_dir=model_args.cache_dir
+        model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        output_hidden_states=False,
+        output_attentions=False,
     )
 
     model.resize_token_embeddings(len(tokenizer))
 
-    # Custom code for mBART
-    handle_mbart(model, tokenizer, data_args.forced_bos_token)
+    # Custom code for mBART and other multilingual models
+    handle_multilingual(model, tokenizer, data_args.forced_bos_token)
 
     # Prepare data
     # - Preprocess data
@@ -494,23 +371,32 @@ def main():
     # - Tokenize
     dp = DatasetPreprocessing(data_args.preprocessing_num_workers)
 
-    preprocessed_datasets = raw_datasets
-
-    preprocessed_datasets = dp.select_dataset_subset(
-        preprocessed_datasets,
+    raw_datasets_subset = dp.select_dataset_subset(
+        raw_datasets,
         data_args.max_train_samples,
         data_args.max_eval_samples,
         data_args.max_predict_samples,
     )
 
     if data_args.dataset_name == "cs_restaurants":
-        preprocessed_datasets = dp.rename_columns_cs_restaurants(preprocessed_datasets)
+        preprocessed_datasets = dp.rename_columns_cs_restaurants(raw_datasets_subset)
     if data_args.dataset_name == "wmt19":
         preprocessed_datasets = dp.rename_columns_translation_dataset(
-            preprocessed_datasets
+            raw_datasets_subset
         )
     if "web_nlg" in data_args.dataset_name:
-        preprocessed_datasets = dp.rename_columns_web_nlg(preprocessed_datasets)
+        preprocessed_datasets = dp.filter_web_nlg_lexicalizations(raw_datasets_subset)
+        preprocessed_datasets = dp.generate_inputs_web_nlg(preprocessed_datasets)
+        # preprocessed_datasets = dp.rename_columns_web_nlg(preprocessed_datasets)
+        preprocessed_datasets["train"] = dp.flatten_lexicalizations_web_nlg(
+            preprocessed_datasets["train"], only_first_lexicalization=False
+        )
+        preprocessed_datasets["validation"] = dp.flatten_lexicalizations_web_nlg(
+            preprocessed_datasets["validation"], only_first_lexicalization=True
+        )
+        preprocessed_datasets["test"] = dp.flatten_lexicalizations_web_nlg(
+            preprocessed_datasets["test"], only_first_lexicalization=True
+        )
 
     # TODO: add for T5
     # if data_args.source_prefix is not None:
@@ -519,7 +405,7 @@ def main():
     #     )
 
     padding = "max_length" if data_args.pad_to_max_length else False
-    preprocessed_datasets = dp.tokenize(
+    tokenized_datasets = dp.tokenize(
         preprocessed_datasets,
         tokenizer,
         padding,
@@ -543,10 +429,14 @@ def main():
         )
 
     # Evaluation class
-    evaluation = Evaluation(tokenizer, data_args.ignore_pad_token_for_loss)
+    evaluation = Evaluation(
+        tokenizer,
+        data_args.ignore_pad_token_for_loss,
+        preprocessed_datasets["validation"],
+    )
 
-    train_data = preprocessed_datasets["train"] if training_args.do_train else None
-    eval_data = preprocessed_datasets["validation"] if training_args.do_eval else None
+    train_data = tokenized_datasets["train"] if training_args.do_train else None
+    eval_data = tokenized_datasets["validation"] if training_args.do_eval else None
     compute_metrics = (
         evaluation.compute_metrics if training_args.predict_with_generate else None
     )
@@ -592,14 +482,13 @@ def main():
     # Evaluation
     # - custom decoding (constrained decoding)
     # - lexicalization
-    max_length = training_args.generation_max_length
-    num_beams = (
-        data_args.num_beams
-        if data_args.num_beams is not None
-        else training_args.generation_num_beams
-    )
-
     if training_args.do_eval:
+        max_length = training_args.generation_max_length
+        num_beams = (
+            data_args.num_beams
+            if data_args.num_beams is not None
+            else training_args.generation_num_beams
+        )
         logger.info("*** Evaluate ***")
 
         metrics = trainer.evaluate(

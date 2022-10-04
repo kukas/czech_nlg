@@ -42,7 +42,7 @@ class Evaluation:
         self.trainer = None
         self.tokenizer = tokenizer
         self.ignore_pad_token_for_loss = ignore_pad_token_for_loss
-        self.metric_key_prefix = "eval"
+        self.split_name = "validation"
         self.eval_dataset = eval_dataset
 
         # Metric
@@ -134,9 +134,7 @@ class Evaluation:
                 # "bleurt": bleurt_output["scores"],
             }
         )
-        csv_path = os.path.join(
-            output_dir, f"outputs_{self.metric_key_prefix}-{step}.csv"
-        )
+        csv_path = os.path.join(output_dir, f"outputs_{self.split_name}-{step}.csv")
         df.to_csv(csv_path)
         logger.info(f"Evaluation set outputs saved in {csv_path}")
 
@@ -144,9 +142,7 @@ class Evaluation:
         print(df)
 
         df = pd.DataFrame([result])
-        csv_path = os.path.join(
-            output_dir, f"results_{self.metric_key_prefix}-{step}.csv"
-        )
+        csv_path = os.path.join(output_dir, f"results_{self.split_name}-{step}.csv")
         df.to_csv(csv_path)
         logger.info(f"Evaluation set results saved in {csv_path}")
 
