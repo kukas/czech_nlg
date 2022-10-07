@@ -1,5 +1,6 @@
 import os
 import logging
+import copy
 
 from dataclasses import dataclass, field
 from typing import Optional
@@ -14,6 +15,8 @@ from transformers import (
     Seq2SeqTrainingArguments,
     HfArgumentParser,
 )
+import torch
+import gc
 
 # Multilingual tokenizers
 from transformers import (
@@ -31,8 +34,6 @@ from datasets import load_dataset
 
 from evaluation import Evaluation
 from dataset_utils import DatasetPreprocessing
-
-# from evaluation import run_e2e_metrics, run_slot_error_rate_metric
 
 logger = logging.getLogger(__name__)
 
@@ -318,6 +319,16 @@ def main():
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
+    # Check if the output_dir already exists and is not empty.
+    if (
+        os.path.isdir(training_args.output_dir)
+        and not training_args.overwrite_output_dir
+        and len(os.listdir(training_args.output_dir)) > 0
+    ):
+        raise ValueError(
+            f"Output directory ({training_args.output_dir}) already exists and is not empty. Use --overwrite_output_dir to overcome."
+        )
+
     last_checkpoint = None
     if training_args.do_train:
         last_checkpoint = detect_last_checkpoint(
@@ -387,7 +398,13 @@ def main():
     if "web_nlg" in data_args.dataset_name:
         preprocessed_datasets = dp.filter_web_nlg_lexicalizations(raw_datasets_subset)
         preprocessed_datasets = dp.generate_inputs_web_nlg(preprocessed_datasets)
-        # preprocessed_datasets = dp.rename_columns_web_nlg(preprocessed_datasets)
+
+        # Copy preprocessed_datasets to preserve multiple references per example
+        preprocessed_datasets_multiple_references = copy.deepcopy(preprocessed_datasets)
+        preprocessed_datasets_multiple_references = (
+            preprocessed_datasets_multiple_references.rename_column("lex", "target")
+        )
+
         preprocessed_datasets["train"] = dp.flatten_lexicalizations_web_nlg(
             preprocessed_datasets["train"], only_first_lexicalization=False
         )
@@ -432,7 +449,11 @@ def main():
     evaluation = Evaluation(
         tokenizer,
         data_args.ignore_pad_token_for_loss,
-        preprocessed_datasets["validation"],
+        # TODO: fix for other datasets than web_nlg
+        preprocessed_datasets_multiple_references["validation"],
+        output_dir=training_args.output_dir,
+        compute_light_metrics=True,
+        compute_heavy_metrics=False,
     )
 
     train_data = tokenized_datasets["train"] if training_args.do_train else None
@@ -479,30 +500,52 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
+    # Free up GPU memory
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # TODO!!!: Refactor this function into train and evaluate functions to be able to free up GPU memory
+
     # Evaluation
     # - custom decoding (constrained decoding)
     # - lexicalization
     if training_args.do_eval:
-        max_length = training_args.generation_max_length
-        num_beams = (
-            data_args.num_beams
-            if data_args.num_beams is not None
-            else training_args.generation_num_beams
-        )
-        logger.info("*** Evaluate ***")
+        # max_length = training_args.generation_max_length
+        # num_beams = (
+        #     data_args.num_beams
+        #     if data_args.num_beams is not None
+        #     else training_args.generation_num_beams
+        # )
+        logger.info("*** Evaluate CSV outputs ***")
 
-        metrics = trainer.evaluate(
-            max_length=max_length, num_beams=num_beams, metric_key_prefix="eval"
+        logger.info("Initialize heavy evaluation metrics")
+        # Evaluation class
+        evaluation = Evaluation(
+            tokenizer,
+            data_args.ignore_pad_token_for_loss,
+            # TODO: fix for other datasets than web_nlg
+            preprocessed_datasets_multiple_references["validation"],
+            output_dir=training_args.output_dir,
+            compute_light_metrics=False,
+            compute_heavy_metrics=True,
         )
-        max_eval_samples = (
-            data_args.max_eval_samples
-            if data_args.max_eval_samples is not None
-            else len(eval_data)
+        evaluation.evaluate_csv_outputs(
+            training_args.output_dir, log_to_csv=True, log_to_wandb=True
         )
-        metrics["eval_samples"] = min(max_eval_samples, len(eval_data))
 
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
+        # metrics = trainer.evaluate(
+        #     max_length=max_length, num_beams=num_beams, metric_key_prefix="eval"
+        # )
+        # max_eval_samples = (
+        #     data_args.max_eval_samples
+        #     if data_args.max_eval_samples is not None
+        #     else len(eval_data)
+        # )
+        # metrics["eval_samples"] = min(max_eval_samples, len(eval_data))
+
+        # trainer.log_metrics("eval", metrics)
+        # trainer.save_metrics("eval", metrics)
 
 
 if __name__ == "__main__":
